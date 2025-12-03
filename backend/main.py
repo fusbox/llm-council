@@ -3,13 +3,13 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from typing import List, Dict, Any
+from pydantic import BaseModel, Field
+from typing import List, Dict, Any, Optional
 import uuid
 import json
 import asyncio
 
-from . import storage
+from . import auth, storage
 from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
 
 app = FastAPI(title="LLM Council API")
@@ -48,6 +48,36 @@ class Conversation(BaseModel):
     created_at: str
     title: str
     messages: List[Dict[str, Any]]
+
+
+class OidcCallbackRequest(BaseModel):
+    """Payload representing an OIDC/OAuth2 callback with token claims."""
+
+    issuer: str
+    subject: str
+    email: Optional[str] = None
+    name: Optional[str] = None
+    claims: Dict[str, Any] = Field(default_factory=dict)
+    device_id: Optional[str] = None
+    user_agent: Optional[str] = None
+
+
+class MfaEnrollRequest(BaseModel):
+    """Request to enroll a new MFA factor."""
+
+    label: str
+
+
+class TotpVerifyRequest(BaseModel):
+    """Request to verify a TOTP factor."""
+
+    code: str
+
+
+class WebAuthnVerifyRequest(BaseModel):
+    """Request to mark a WebAuthn factor as verified."""
+
+    assertion: str
 
 
 @app.get("/")
@@ -192,6 +222,106 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             "Connection": "keep-alive",
         }
     )
+
+
+@app.post("/api/auth/oidc/callback")
+async def oidc_callback(request: OidcCallbackRequest):
+    """Handle an OIDC/OAuth2 callback and map claims to an internal user record."""
+
+    claims = {
+        "iss": request.issuer,
+        "sub": request.subject,
+        "email": request.email,
+        "name": request.name,
+        **request.claims,
+    }
+    if request.device_id:
+        claims["device_id"] = request.device_id
+    if request.user_agent:
+        claims["user_agent"] = request.user_agent
+
+    user, session = auth.map_oidc_claims_to_user(claims)
+    return {
+        "user": user.to_public_dict(),
+        "session": session.to_dict()
+    }
+
+
+@app.post("/api/auth/{user_id}/mfa/totp/enroll")
+async def enroll_totp(user_id: str, request: MfaEnrollRequest):
+    """Enroll a new TOTP factor for a user."""
+    try:
+        factor, otpauth_uri = auth.enroll_totp(user_id, request.label)
+        return {
+            "factor": factor.to_public_dict(include_secret=True),
+            "otpauth_uri": otpauth_uri
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/auth/{user_id}/mfa/totp/{factor_id}/verify")
+async def verify_totp(user_id: str, factor_id: str, request: TotpVerifyRequest):
+    """Verify a TOTP code and mark the factor as confirmed."""
+    try:
+        success = auth.verify_totp_factor(user_id, factor_id, request.code)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    if not success:
+        raise HTTPException(status_code=400, detail="Invalid TOTP code")
+
+    return {"status": "verified"}
+
+
+@app.post("/api/auth/{user_id}/mfa/webauthn/enroll")
+async def enroll_webauthn(user_id: str, request: MfaEnrollRequest):
+    """Create a placeholder WebAuthn factor with a challenge hook."""
+    try:
+        factor = auth.enroll_webauthn_hook(user_id, request.label)
+        return {"factor": factor.to_public_dict(include_secret=True)}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/auth/{user_id}/mfa/webauthn/{factor_id}/verify")
+async def verify_webauthn(user_id: str, factor_id: str, request: WebAuthnVerifyRequest):
+    """Mark a WebAuthn factor as verified after an external authenticator assertion."""
+    try:
+        success = auth.verify_webauthn_hook(user_id, factor_id, request.assertion)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    if not success:
+        raise HTTPException(status_code=400, detail="Invalid WebAuthn assertion")
+
+    return {"status": "verified"}
+
+
+@app.get("/api/auth/{user_id}/sessions")
+async def list_sessions(user_id: str):
+    """List active and revoked sessions/devices for a user."""
+    sessions = auth.list_sessions(user_id)
+    return [s.to_dict() for s in sessions]
+
+
+@app.post("/api/auth/{user_id}/sessions/revoke_all")
+async def revoke_all_sessions(user_id: str):
+    """Revoke all sessions for a user."""
+    sessions = auth.revoke_all_sessions(user_id)
+    return {
+        "revoked": [s.id for s in sessions]
+    }
+
+
+@app.post("/api/auth/{user_id}/sessions/{session_id}/revoke")
+async def revoke_session(user_id: str, session_id: str):
+    """Revoke a specific device/session for a user."""
+    try:
+        session = auth.revoke_session(user_id, session_id)
+        return {"session": session.to_dict()}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
 if __name__ == "__main__":

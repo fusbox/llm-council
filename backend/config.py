@@ -22,5 +22,7 @@ CHAIRMAN_MODEL = "google/gemini-3-pro-preview"
 # OpenRouter API endpoint
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Data directory for conversation storage
+# Data directories
 DATA_DIR = "data/conversations"
+AUTH_DATA_DIR = "data/auth"
+AUTH_STATE_FILE = os.path.join(AUTH_DATA_DIR, "auth_state.json")
