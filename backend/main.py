@@ -1,18 +1,26 @@
 """FastAPI backend for LLM Council."""
 
-from fastapi import FastAPI, HTTPException
+import asyncio
+import json
+import logging
+import os
+import uuid
+from typing import Any, Dict, List
+
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 from pydantic import BaseModel
-from typing import List, Dict, Any
-import uuid
-import json
-import asyncio
 
 from . import storage
+from .auth import AUTH_STORE, Notifier, RateLimiter
 from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
 
 app = FastAPI(title="LLM Council API")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Enable CORS for local development
 app.add_middleware(
@@ -23,10 +31,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Authentication helpers
+rate_limiter = RateLimiter(max_attempts=5, window_seconds=60, block_seconds=300)
+notifier = Notifier(mode=os.getenv("NOTIFIER_MODE", "log"))
+
+# Metrics
+LOGIN_ATTEMPTS = Counter("auth_login_attempts_total", "Total login attempts")
+LOGIN_SUCCESSES = Counter("auth_login_success_total", "Successful logins")
+LOGIN_FAILURES = Counter("auth_login_failure_total", "Failed logins")
+LOGIN_THROTTLED = Counter("auth_login_throttled_total", "Throttled login attempts")
+PASSWORD_RESET_REQUESTS = Counter(
+    "auth_password_reset_requests_total", "Password reset requests"
+)
+PASSWORD_RESET_SUCCESSES = Counter(
+    "auth_password_reset_success_total", "Successful password resets"
+)
+PASSWORD_RESET_FAILURES = Counter(
+    "auth_password_reset_failure_total", "Failed password resets"
+)
+
 
 class CreateConversationRequest(BaseModel):
     """Request to create a new conversation."""
     pass
+
+
+class LoginRequest(BaseModel):
+    """User login request payload."""
+
+    username: str
+    password: str
+
+
+class PasswordResetRequest(BaseModel):
+    """Initiate password reset payload."""
+
+    email: str
+
+
+class PasswordResetConfirmation(BaseModel):
+    """Confirm password reset payload."""
+
+    token: str
+    new_password: str
 
 
 class SendMessageRequest(BaseModel):
@@ -54,6 +101,77 @@ class Conversation(BaseModel):
 async def root():
     """Health check endpoint."""
     return {"status": "ok", "service": "LLM Council API"}
+
+
+@app.post("/api/auth/login")
+async def login(request: Request, payload: LoginRequest):
+    """Authenticate a user with simple rate limiting."""
+
+    key = f"{request.client.host}:{payload.username}"
+    if not rate_limiter.allow(key):
+        LOGIN_THROTTLED.inc()
+        logger.warning(
+            "auth_throttled",
+            extra={"username": payload.username, "client_ip": request.client.host},
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Too many login attempts. Please wait before retrying.",
+        )
+
+    LOGIN_ATTEMPTS.inc()
+
+    if AUTH_STORE.authenticate(payload.username, payload.password):
+        LOGIN_SUCCESSES.inc()
+        logger.info(
+            "auth_success",
+            extra={"username": payload.username, "client_ip": request.client.host},
+        )
+        return {"status": "ok", "message": "Login successful"}
+
+    LOGIN_FAILURES.inc()
+    logger.warning(
+        "auth_failure",
+        extra={"username": payload.username, "client_ip": request.client.host},
+    )
+    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+
+@app.post("/api/auth/password/forgot")
+async def request_password_reset(payload: PasswordResetRequest):
+    """Issue a one-time password reset token and dispatch via notifier."""
+
+    PASSWORD_RESET_REQUESTS.inc()
+    token = AUTH_STORE.create_reset_token(payload.email)
+    if token:
+        notifier.send_password_reset(payload.email, token)
+        logger.info("password_reset_requested", extra={"email": payload.email})
+        return {"status": "ok", "message": "If the account exists, a token was sent."}
+
+    PASSWORD_RESET_FAILURES.inc()
+    logger.warning("password_reset_request_failed", extra={"email": payload.email})
+    return {"status": "ok", "message": "If the account exists, a token was sent."}
+
+
+@app.post("/api/auth/password/reset")
+async def reset_password(payload: PasswordResetConfirmation):
+    """Reset the password using a signed, one-time token."""
+
+    username = AUTH_STORE.validate_reset_token(payload.token)
+    if not username:
+        PASSWORD_RESET_FAILURES.inc()
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
+
+    try:
+        AUTH_STORE.set_password(username, payload.new_password)
+    except ValueError:
+        PASSWORD_RESET_FAILURES.inc()
+        raise HTTPException(status_code=404, detail="User not found")
+
+    AUTH_STORE.mark_token_used(payload.token)
+    PASSWORD_RESET_SUCCESSES.inc()
+    logger.info("password_reset_success", extra={"username": username})
+    return {"status": "ok", "message": "Password reset successful"}
 
 
 @app.get("/api/conversations", response_model=List[ConversationMetadata])
@@ -192,6 +310,13 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             "Connection": "keep-alive",
         }
     )
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint."""
+
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 if __name__ == "__main__":
