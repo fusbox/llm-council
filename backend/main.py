@@ -1,8 +1,8 @@
 """FastAPI backend for LLM Council."""
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any
 import uuid
@@ -10,8 +10,10 @@ import json
 import asyncio
 
 from . import storage
+from .auth_service import AuthService
 from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
 
+auth_service = AuthService()
 app = FastAPI(title="LLM Council API")
 
 # Enable CORS for local development
@@ -50,10 +52,74 @@ class Conversation(BaseModel):
     messages: List[Dict[str, Any]]
 
 
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+    device_id: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+    device_id: str
+
+
+class TokenRequest(BaseModel):
+    refresh_token: str
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str
+    expires_in: int
+    user: Dict[str, Any]
+
+
+@app.middleware("http")
+async def authenticate_request(request: Request, call_next):
+    """Verify bearer token and inject user context when provided."""
+    auth_header = request.headers.get("Authorization")
+    request.state.user = None
+    if auth_header and auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1]
+        try:
+            request.state.user = auth_service.verify_access_token(token)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    response = await call_next(request)
+    return response
+
+
 @app.get("/")
 async def root():
     """Health check endpoint."""
     return {"status": "ok", "service": "LLM Council API"}
+
+
+@app.post("/api/auth/signup", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
+async def signup(request: SignupRequest):
+    """Register a new user and return auth tokens."""
+    return auth_service.sign_up(request.email, request.password, request.device_id)
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+async def login(request: LoginRequest):
+    """Authenticate a user and return auth tokens."""
+    return auth_service.login(request.email, request.password, request.device_id)
+
+
+@app.post("/api/auth/logout")
+async def logout(request: TokenRequest):
+    """Revoke a refresh token for the provided session/device."""
+    auth_service.logout(request.refresh_token)
+    return {"status": "logged_out"}
+
+
+@app.post("/api/auth/refresh", response_model=AuthResponse)
+async def refresh(request: TokenRequest):
+    """Rotate refresh token and issue new access credentials."""
+    return auth_service.refresh(request.refresh_token)
 
 
 @app.get("/api/conversations", response_model=List[ConversationMetadata])
